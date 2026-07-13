@@ -1,74 +1,150 @@
-// Fundamentals Pipeline — starter script
-// Delete whichever branch (Teachable Machine / Roboflow) you are not using.
+// Audio First layout — no camera preview, one big word, one button.
+// Best for users with no or very low usable vision. Detection/speech
+// logic below is carried over unchanged in behavior from big-screen.
 
-const startBtn = document.getElementById("start-btn");
-const labelContainer = document.getElementById("label-container");
-const webcam = document.getElementById("webcam");
-
-// ---------- OPTION A: Teachable Machine ----------
-// Export via "Export Model > Download my model" (TensorFlow.js tab),
-// unzip, and commit model.json + weights.bin + metadata.json into a
-// /model folder in this repo (see the worksheet for exact steps).
-// Keeping your own copy means your interface doesn't depend on Google's
-// hosting staying up.
+// Points at the model.json/weights.bin/metadata.json committed in
+// this repo's /model folder.
 const MODEL_URL = "./model/";
-// Alternative: point at your Teachable Machine hosted shareable link
-// instead of local files, e.g.:
-// const MODEL_URL = "https://teachablemachine.withgoogle.com/models/XXXXXXXXX/";
 
-async function initTeachableMachine() {
-  const modelURL = MODEL_URL + "model.json";
-  const metadataURL = MODEL_URL + "metadata.json";
+const CONFIDENCE_THRESHOLD = 0.75;   // don't announce low-confidence guesses (never shown on screen)
+const STABLE_FRAMES_NEEDED = 5;      // require a few consistent frames before speaking
+const REPEAT_COOLDOWN_MS = 2500;     // don't re-announce the same class too often
 
-  const model = await tmImage.load(modelURL, metadataURL);
-  const maxPredictions = model.getTotalClasses();
+const mainBtn = document.getElementById("main-btn");
+const startError = document.getElementById("start-error");
+const guessEl = document.getElementById("guess");
+const statusText = document.getElementById("status-text");
+const dot = document.getElementById("dot");
+const webcam = document.getElementById("webcam");
+const srAnnounce = document.getElementById("sr-announce");
 
-  const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-  webcam.srcObject = stream;
-  await webcam.play();
+let model, running = false, currentStream = null;
+let candidateClass = null, candidateStreak = 0;
+let lastSpokenClass = null, lastSpokenAt = 0;
 
-  window.requestAnimationFrame(loop);
+function speak(text) {
+  if (!("speechSynthesis" in window)) return;
+  window.speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.rate = 1;
+  window.speechSynthesis.speak(utter);
+  srAnnounce.textContent = text;
+}
 
-  async function loop() {
-    const prediction = await model.predict(webcam);
-    labelContainer.innerHTML = prediction
-      .map(p => `${p.className}: ${(p.probability * 100).toFixed(1)}%`)
-      .join("<br>");
-    window.requestAnimationFrame(loop);
+function describeError(err) {
+  if (err && err.name === "NotAllowedError") {
+    return "Camera access was blocked. Allow camera access in your browser settings, then try again.";
+  }
+  if (err && err.name === "NotFoundError") {
+    return "No camera was found on this device.";
+  }
+  if (err && err.name === "NotReadableError") {
+    return "The camera is being used by another app. Close it, then try again.";
+  }
+  return "Something went wrong starting the camera. Try again.";
+}
+
+function stopCamera() {
+  running = false;
+  if (currentStream) {
+    currentStream.getTracks().forEach((t) => t.stop());
+    currentStream = null;
   }
 }
 
-// ---------- OPTION B: Roboflow ----------
-// NEVER hardcode your API key here. Prompt for it client-side, or read it
-// from a config.js file that is listed in .gitignore.
-const ROBOFLOW_MODEL_ENDPOINT = "https://detect.roboflow.com/YOUR_PROJECT/YOUR_VERSION";
+async function init() {
+  mainBtn.disabled = true;
+  mainBtn.textContent = "Starting…";
+  startError.textContent = "";
+  statusText.textContent = "Loading model…";
 
-async function initRoboflow() {
-  const apiKey = prompt("Enter your Roboflow API key (not stored, session only):");
+  try {
+    if (!model) {
+      model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
+    }
 
-  const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-  webcam.srcObject = stream;
-  await webcam.play();
-
-  setInterval(async () => {
-    const canvas = document.getElementById("output-canvas");
-    canvas.width = webcam.videoWidth;
-    canvas.height = webcam.videoHeight;
-    canvas.getContext("2d").drawImage(webcam, 0, 0);
-    const base64 = canvas.toDataURL("image/jpeg").split(",")[1];
-
-    const res = await fetch(`${ROBOFLOW_MODEL_ENDPOINT}?api_key=${apiKey}`, {
-      method: "POST",
-      body: base64,
-      headers: { "Content-Type": "application/x-www-form-urlencoded" }
+    // "ideal" (not "exact") so this still works on a laptop with only
+    // one camera — it just falls back gracefully there.
+    currentStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" } }
     });
-    const result = await res.json();
-    labelContainer.innerText = JSON.stringify(result.predictions, null, 2);
-  }, 1000);
+    webcam.srcObject = currentStream;
+    await webcam.play();
+
+    try {
+      if ("wakeLock" in navigator) await navigator.wakeLock.request("screen");
+    } catch (e) { /* not critical if unsupported — screen may just dim on long use */ }
+
+    running = true;
+    dot.classList.add("live");
+    statusText.textContent = "Listening…";
+    guessEl.textContent = "Listening…";
+    mainBtn.disabled = false;
+    mainBtn.textContent = "Tap to hear it again";
+
+    requestAnimationFrame(loop);
+  } catch (err) {
+    running = false;
+    dot.classList.remove("live");
+    statusText.textContent = "Point your camera at an object";
+    mainBtn.disabled = false;
+    mainBtn.textContent = "Start listening";
+    startError.textContent = describeError(err);
+  }
 }
 
-startBtn.addEventListener("click", () => {
-  // Call whichever function matches your pipeline:
-  initTeachableMachine();
-  // initRoboflow();
+async function loop() {
+  if (!running) return;
+  const predictions = await model.predict(webcam);
+  predictions.sort((a, b) => b.probability - a.probability);
+  const top = predictions[0];
+
+  // Confidence is used internally for the threshold/stability logic
+  // only — this layout never displays a percentage.
+  if (top.probability >= CONFIDENCE_THRESHOLD) {
+    guessEl.textContent = top.className;
+
+    if (top.className === candidateClass) {
+      candidateStreak++;
+    } else {
+      candidateClass = top.className;
+      candidateStreak = 1;
+    }
+
+    const now = Date.now();
+    const stableEnough = candidateStreak >= STABLE_FRAMES_NEEDED;
+    const changedOrCooldownPassed =
+      candidateClass !== lastSpokenClass || now - lastSpokenAt > REPEAT_COOLDOWN_MS * 4;
+
+    if (stableEnough && changedOrCooldownPassed) {
+      speak(candidateClass);
+      lastSpokenClass = candidateClass;
+      lastSpokenAt = now;
+      candidateStreak = 0;
+    }
+  } else {
+    guessEl.textContent = "Listening…";
+    candidateClass = null;
+    candidateStreak = 0;
+  }
+
+  requestAnimationFrame(loop);
+}
+
+// One button does double duty: before running it starts the camera;
+// once running, tapping it repeats the last confident, stable guess.
+mainBtn.addEventListener("click", () => {
+  if (!running) {
+    init();
+    return;
+  }
+  if (lastSpokenClass) {
+    speak(lastSpokenClass);
+  } else if (guessEl.textContent && guessEl.textContent !== "Listening…" && guessEl.textContent !== "Ready") {
+    speak(guessEl.textContent);
+  }
 });
+
+window.addEventListener("DOMContentLoaded", () => mainBtn.focus());
+
+window.addEventListener("beforeunload", stopCamera);
